@@ -1,4 +1,4 @@
-// Token Radar, radar-3 entry for make.fun's token-radar-01 (Node 22, standard library only).
+// Token Radar, radar-4 entry for make.fun's token-radar-01 (Node 22, standard library only).
 //
 // The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores
 // every pre-token protocol with the calibrated model in lib/model.ts, writes the ranked board to
@@ -8,7 +8,8 @@
 // The dashboard is a static page, no framework and no network: dashboard/index.html, dashboard/app.css
 // and dashboard/app.js read /output/data.js, which this program writes from the same board. The board
 // covers the whole watchlist plus every other rankable pre-token protocol, states the model and its
-// calibration, and gives every protocol a farm plan with costs and times.
+// calibration — per-category comps curves, a 5-fold blind test and a walk-forward test — and gives
+// every protocol a farm plan with costs and times, netted to the dollar after unwind.
 //
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
@@ -43,7 +44,7 @@ if (!existsSync(inputFile)) {
 const out = arg('output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
 
 const snapshot = parseSnapshot(readFileSync(inputFile, 'utf8'));
-const { board, radar, calibration, validation } = buildRadar(snapshot);
+const { board, radar, calibration, validation, walk_forward } = buildRadar(snapshot);
 const issue = boardIssue(board, snapshot);
 if (issue !== null) {
   process.stderr.write(`token radar: the model wrote a board the gate refuses: ${issue}\n`);
@@ -86,9 +87,10 @@ for (const name of shots) {
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
 process.stdout.write(
-  `token radar radar-3: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
-    `token radar: calibration from ${calibration.global_samples} traded protocols, global median FDV/TVL ${calibration.global_median}, comps curve ln(FDV/TVL) = ${calibration.curve.intercept.toFixed(4)} ${calibration.curve.slope >= 0 ? '+' : '-'} ${Math.abs(calibration.curve.slope).toFixed(4)} ln(TVL), correlation ${calibration.curve.correlation.toFixed(3)}, ${calibration.entries.length} categories\n` +
+  `token radar radar-4: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
+    `token radar: calibration from ${calibration.global_samples} traded protocols, global median FDV/TVL ${calibration.global_median}, comps curve ln(FDV/TVL) = ${calibration.curve.intercept.toFixed(4)} ${calibration.curve.slope >= 0 ? '+' : '-'} ${Math.abs(calibration.curve.slope).toFixed(4)} ln(TVL), correlation ${calibration.curve.correlation.toFixed(3)}, ${calibration.entries.length} categories, ${calibration.category_curves.length} per-category curves (min ${radar.model.category_curve_min_n} traded each)\n` +
     `token radar: blind test on ${validation.holdout_size} held-out traded protocols (5-fold, trained on ${validation.train_size} each fold): median abs log error ${validation.median_abs_log_error} (baseline ${validation.baseline_median_abs_log_error}), median abs pct error ${validation.median_abs_pct_error}, within 2x ${validation.within_2x} (baseline ${validation.baseline_within_2x}), within 3x ${validation.within_3x}, median log ratio ${validation.median_log_ratio}\n` +
+    `token radar: walk-forward on ${walk_forward.dated_protocols} dated traded protocols, ${walk_forward.windows.length} windows, ${walk_forward.test_rows} test rows: per-category curve pooled median abs log error ${walk_forward.pooled_per_category_median_abs_log_error} (global curve ${walk_forward.pooled_global_median_abs_log_error}), within 2x ${walk_forward.pooled_per_category_within_2x} (global ${walk_forward.pooled_global_within_2x})\n` +
     `token radar: rank ranges over ${radar.refits} bootstrap refits, median band width ${medianBandWidth(board)} ranks\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
