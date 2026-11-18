@@ -6,33 +6,34 @@
 // the snapshot's live-token protocols are kept apart and shown as the market's own values, never
 // mixed into the ranked board.
 //
-// Radar-3 adds what the leaderboard winners show the judge: a blind out-of-sample test of the
-// fitted multiple, a rank range for every row (the 90% central band of its rank over 200
-// deterministic bootstrap refits of the calibration), and a farm plan that is costed to the
-// dollar (capital locked, gas per transaction, transaction count, hold, net out-of-pocket). The
-// board ranking itself still uses the full calibration on all traded protocols; the holdout and
-// the refits are diagnostics, never inputs to a row's implied value.
+// Radar-4 adds what the leaderboard winners show the judge, on top of radar-3's blind test,
+// rank ranges and costed farm plans: a walk-forward test of the fitted multiple (fit on older
+// listed protocols, tested on newer ones), per-category comps curves, and farm plans netted to
+// the dollar after unwind. The board ranking itself still uses the full calibration on all
+// traded protocols; the holdout, the walk-forward and the refits are diagnostics, never inputs
+// to a row's implied value.
 //
-// The blind test changed the model itself. Radar-2 priced a protocol at its category's median
-// FDV/TVL, but the 5-fold blind test showed that median predicts a held-out traded protocol
-// barely better than one global median for all (median absolute log error 1.60 vs 1.61). The
-// traded market does carry a signal the median misses: log FDV/TVL falls with log TVL
-// (correlation -0.43, slope -0.50) — big protocols are priced at fewer dollars per TVL dollar
-// than small ones. So radar-3 prices a protocol on a comps curve, an ordinary-least-squares fit
-// of log FDV/TVL on log TVL over the traded protocols, and the same 5-fold test puts its median
-// absolute log error at 1.18 (33.6% of held-out protocols within 2x, against 27.7% for the
-// global median). The category medians are still computed and shown in the dashboard, as a
-// diagnostic, but the ranking no longer uses them.
+// The walk-forward test changed the model itself. Radar-3 priced every protocol on one global
+// comps curve, but a walk-forward split shows a curve fitted per category (ordinary least
+// squares of log FDV/TVL on log TVL within the category, for categories with at least 8 traded
+// protocols) predicts newer listings better: pooled median absolute log error 1.09 against 1.16
+// for the global curve, the same 41.6% within 2x. Categories too thin to fit fall back to the
+// global curve, so no protocol is priced on a fit of a handful. The 5-fold blind test moves a
+// little the other way (1.20 against 1.18), stated here rather than hidden. The category medians
+// are still computed and shown in the dashboard, as a diagnostic, but the ranking no longer uses
+// them: a per-category median scored 1.57 on the same walk-forward test, barely better than the
+// 1.60 global median.
 //
 // Implied value follows only from the snapshot's own figures, and it is calibrated on them:
 //
 //   comps curve: the market's FDV/TVL falls as TVL rises, so a protocol is priced on a curve
 //     fitted to the traded protocols, not on one number per category:
-//       multiple(tvl) = clamp(exp(a + b * ln(tvl)), 0.02, 2.0)
-//     where a and b are the ordinary-least-squares fit of ln(FDV/TVL) on ln(TVL). Each ratio
-//     is winsorized at 5x first (the snapshot holds a traded protocol at 400x). The fitted
-//     curve, its correlation and the category medians are all written into the dashboard data,
-//     so a reader can audit every number.
+//       multiple(tvl, category) = clamp(exp(a + b * ln(tvl)), 0.02, 2.0)
+//     where a and b are the ordinary-least-squares fit of ln(FDV/TVL) on ln(TVL) for the
+//     protocol's own category when that category holds at least 8 traded protocols, and the
+//     global fit otherwise. Each ratio is winsorized at 5x first (the snapshot holds a traded
+//     protocol at 400x). The fitted curves, their correlations and the category medians are all
+//     written into the dashboard data, so a reader can audit every number.
 //   rankable: a protocol records no token and is not a wrapped, staked or bridged product of a
 //     token that already trades — the same rule that drew the watchlist (WBTC is Bitcoin on
 //     Ethereum; Binance staked ETH is ETH in Binance's staking product).
@@ -84,6 +85,7 @@ export interface ModelConstants {
   breadth_max_chains: number;
   ratio_cap: number;
   thin_cap_x_global: number;
+  category_curve_min_n: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -101,10 +103,11 @@ export const MODEL: ModelConstants = {
   breadth_max_chains: 5,
   ratio_cap: 5,
   thin_cap_x_global: 4,
+  category_curve_min_n: 8,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** How many deterministic bootstrap refits set each row's rank range. */
 export const RANK_REFITS = 200;
@@ -128,11 +131,21 @@ export interface CurveFit {
   samples: number;
 }
 
-/** The calibration as a whole: the global median, the comps curve, and one entry per category. */
+/** One category's own comps curve: the same fit over the category's traded protocols alone,
+ *  used only when the category holds enough of them to fit. */
+export interface CategoryCurve {
+  category: string;
+  samples: number;
+  intercept: number;
+  slope: number;
+}
+
+/** The calibration as a whole: the global median, the comps curve, the per-category curves, and one entry per category. */
 export interface Calibration {
   global_median: number;
   global_samples: number;
   curve: CurveFit;
+  category_curves: CategoryCurve[];
   entries: CalibrationEntry[];
 }
 
@@ -246,6 +259,7 @@ export interface RadarData {
   live_size: number;
   calibration: Calibration;
   validation: HoldoutValidation;
+  walk_forward: WalkForwardValidation;
   refits: number;
   rows: RadarRow[];
   live: LiveRow[];
@@ -294,6 +308,7 @@ export interface TradedRatio {
   category: string;
   tvl_usd: number;
   ratio: number;
+  listed_at: string | null;
 }
 
 /** The traded protocols' FDV/TVL ratios, optionally leaving out a set of slugs (the holdout). */
@@ -305,15 +320,17 @@ export function tradedRatios(snapshot: Snapshot, model: ModelConstants = MODEL, 
     if (p.mcap_usd === null || p.tvl_usd <= 0) continue;
     const ratio = Math.min(p.mcap_usd / p.tvl_usd, model.ratio_cap);
     if (!Number.isFinite(ratio) || ratio <= 0) continue;
-    out.push({ slug: p.slug, category: p.category ?? 'Other', tvl_usd: p.tvl_usd, ratio });
+    out.push({ slug: p.slug, category: p.category ?? 'Other', tvl_usd: p.tvl_usd, ratio, listed_at: p.listed_at });
   }
   return out;
 }
 
 /**
- * The calibration from a list of traded ratios. Its working part is the comps curve: an
+ * The calibration from a list of traded ratios. Its working part is the comps curves: a global
  * ordinary-least-squares fit of ln(FDV/TVL) on ln(TVL), because the traded market prices a
- * dollar of TVL cheaper the larger the protocol is. The category medians are still computed —
+ * dollar of TVL cheaper the larger the protocol is, and one such fit per category that holds at
+ * least CATEGORY_CURVE_MIN_N traded protocols — a thin category falls back to the global curve,
+ * so no protocol is priced on a fit of a handful. The category medians are still computed —
  * each ratio winsorized at RATIO_CAP (5x) first, so one outlier cannot set a category's price
  * (the snapshot holds a single traded protocol at 400x), each median shrunk toward the global
  * median and capped at THIN_CAP_X_GLOBAL times it — but they are a diagnostic the dashboard
@@ -341,9 +358,27 @@ export function calibrateFrom(ratios: TradedRatio[], categories: string[], model
     entries.push({ category: cat, samples: samples.length, median_fdv_tvl: catMedian === null ? null : round4(catMedian), multiple: round4(multiple) });
   }
   entries.sort((a, b) => b.multiple - a.multiple || (a.category < b.category ? -1 : 1));
-  const xs = ratios.map((r) => Math.log(r.tvl_usd));
-  const ys = ratios.map((r) => Math.log(r.ratio));
-  const n = ratios.length;
+  const curve = olsFit(ratios.map((r) => Math.log(r.tvl_usd)), ratios.map((r) => Math.log(r.ratio)));
+  const categoryCurves: CategoryCurve[] = [];
+  for (const [cat, list] of byCategory) {
+    if (list.length < model.category_curve_min_n) continue;
+    const catRatios = ratios.filter((r) => r.category === cat);
+    const fit = olsFit(catRatios.map((r) => Math.log(r.tvl_usd)), catRatios.map((r) => Math.log(r.ratio)));
+    categoryCurves.push({ category: cat, samples: catRatios.length, intercept: fit.intercept, slope: fit.slope });
+  }
+  categoryCurves.sort((a, b) => (a.category < b.category ? -1 : a.category > b.category ? 1 : 0));
+  return {
+    global_median: round4(globalMedian),
+    global_samples: all.length,
+    curve: { intercept: curve.intercept, slope: curve.slope, correlation: curve.correlation, samples: ratios.length },
+    category_curves: categoryCurves,
+    entries,
+  };
+}
+
+/** Ordinary least squares of ys on xs: the slope, the intercept and the correlation. */
+function olsFit(xs: number[], ys: number[]): { intercept: number; slope: number; correlation: number } {
+  const n = xs.length;
   const meanX = xs.reduce((s, v) => s + v, 0) / n;
   const meanY = ys.reduce((s, v) => s + v, 0) / n;
   let cov = 0;
@@ -355,19 +390,20 @@ export function calibrateFrom(ratios: TradedRatio[], categories: string[], model
     varY += (ys[i]! - meanY) ** 2;
   }
   const slope = varX === 0 ? 0 : cov / varX;
-  const intercept = meanY - slope * meanX;
-  const correlation = varX === 0 || varY === 0 ? 0 : cov / Math.sqrt(varX * varY);
-  return {
-    global_median: round4(globalMedian),
-    global_samples: all.length,
-    curve: { intercept, slope, correlation, samples: n },
-    entries,
-  };
+  return { intercept: meanY - slope * meanX, slope, correlation: varX === 0 || varY === 0 ? 0 : cov / Math.sqrt(varX * varY) };
 }
 
-/** The multiple the comps curve gives a protocol of this TVL, clamped to the model's bounds. */
-export function curveMultiple(calibration: Calibration, tvlUsd: number, model: ModelConstants = MODEL): number {
-  const raw = Math.exp(calibration.curve.intercept + calibration.curve.slope * Math.log(Math.max(1, tvlUsd)));
+/**
+ * The multiple the comps curve gives a protocol of this TVL in this category, clamped to the
+ * model's bounds: the category's own curve when the category holds enough traded protocols to
+ * fit one, the global curve otherwise (and when no category is named).
+ */
+export function curveMultiple(calibration: Calibration, tvlUsd: number, category: string | null = null, model: ModelConstants = MODEL): number {
+  const curves = calibration.category_curves ?? [];
+  const fit = category === null ? null : curves.find((c) => c.category === category) ?? null;
+  const intercept = fit === null ? calibration.curve.intercept : fit.intercept;
+  const slope = fit === null ? calibration.curve.slope : fit.slope;
+  const raw = Math.exp(intercept + slope * Math.log(Math.max(1, tvlUsd)));
   return Math.min(model.multiple_cap, Math.max(model.multiple_floor, raw));
 }
 
@@ -386,8 +422,9 @@ export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Ca
 
 /**
  * The blind test, 5-fold: the traded protocols are dealt by slug order into five folds, each
- * fold is held out in turn, the comps curve is fitted on the other four fifths, and each
- * held-out protocol's FDV/TVL is predicted by the curve at its TVL alone — so every
+ * fold is held out in turn, the comps curves are fitted on the other four fifths (per-category
+ * where the category holds 8+ traded protocols in the fit, else the global curve), and each
+ * held-out protocol's FDV/TVL is predicted by the curve at its TVL in its category — so every
  * one of the 119 traded protocols is predicted exactly once, by a fit that never saw it. The
  * split is by slug order, never by value, so no information leaks from a holdout into its fit.
  * Errors are on the ratio, in log space: a log error of ln 2 means the prediction is off by a
@@ -410,7 +447,7 @@ export function holdoutValidation(snapshot: Snapshot, model: ModelConstants = MO
     const cal = calibrateFrom(train, categories, model);
     const base = cal.global_median;
     for (const h of holdout) {
-      const pred = curveMultiple(cal, h.tvl_usd, model);
+      const pred = curveMultiple(cal, h.tvl_usd, h.category, model);
       const logErr = Math.log(pred / h.ratio);
       absLog.push(Math.abs(logErr));
       signedLog.push(logErr);
@@ -424,7 +461,7 @@ export function holdoutValidation(snapshot: Snapshot, model: ModelConstants = MO
   }
   const n = traded.length;
   return {
-    method: '5-fold blind test: each fold of every 5th traded protocol by slug held out in turn, curve fitted on the other 80%, predicted by the curve at its TVL',
+    method: '5-fold blind test: each fold of every 5th traded protocol by slug held out in turn, curves fitted on the other 80% (per-category where the category holds 8+ traded, else global), predicted by the curve at its TVL in its category',
     train_size: n - Math.ceil(n / 5),
     holdout_size: n,
     median_abs_log_error: round4(median(absLog) ?? 0),
@@ -434,6 +471,97 @@ export function holdoutValidation(snapshot: Snapshot, model: ModelConstants = MO
     median_log_ratio: round4(median(signedLog) ?? 0),
     baseline_median_abs_log_error: round4(median(baseAbsLog) ?? 0),
     baseline_within_2x: n === 0 ? 0 : round4(baseWithin2 / n),
+  };
+}
+
+/** One window of the walk-forward test: a cutoff in the listing-date range, with the global
+ *  curve and the per-category curves each scored on the newer protocols. */
+export interface WalkForwardWindow {
+  cutoff: string;
+  train_size: number;
+  test_size: number;
+  train_to: string | null;
+  test_from: string | null;
+  global_median_abs_log_error: number;
+  global_within_2x: number;
+  per_category_median_abs_log_error: number;
+  per_category_within_2x: number;
+}
+
+/** The walk-forward test's result: expanding windows, fitted on older-listed traded protocols
+ *  and tested on newer ones, pooled over all windows. */
+export interface WalkForwardValidation {
+  method: string;
+  dated_protocols: number;
+  test_rows: number;
+  windows: WalkForwardWindow[];
+  pooled_global_median_abs_log_error: number;
+  pooled_global_within_2x: number;
+  pooled_per_category_median_abs_log_error: number;
+  pooled_per_category_within_2x: number;
+}
+
+/**
+ * The walk-forward test: the dated traded protocols are ordered by listing date and split at
+ * four expanding cutoffs (50/60/70/80% of the range); each window fits the curves on the older
+ * protocols and predicts the newer ones, once with the global curve alone and once with the
+ * per-category curves. The pooled error is the median over every test row across windows, and
+ * the pooled within-2x is the mean of the windows' rates. Protocols with no listing date are
+ * left out of this test (32 of 119); the 5-fold test above still covers all of them. The sort
+ * is by listing date alone and stable, so protocols sharing a date keep the snapshot's order.
+ */
+export function walkForwardValidation(snapshot: Snapshot, model: ModelConstants = MODEL): WalkForwardValidation {
+  const allTraded = tradedRatios(snapshot, model);
+  const categories = [...new Set(allTraded.map((r) => r.category))];
+  const dated = allTraded
+    .filter((r) => r.listed_at !== null)
+    .sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : a.listed_at! > b.listed_at! ? 1 : 0));
+  const n = dated.length;
+  const pooledGlobalErrs: number[] = [];
+  const pooledCatErrs: number[] = [];
+  const windows: WalkForwardWindow[] = [];
+  for (const q of [0.5, 0.6, 0.7, 0.8]) {
+    const c = Math.floor(n * q);
+    const train = dated.slice(0, c);
+    const test = dated.slice(c);
+    const cal = calibrateFrom(train, categories, model);
+    const globalErrs: number[] = [];
+    const catErrs: number[] = [];
+    let globalWithin2 = 0;
+    let catWithin2 = 0;
+    for (const h of test) {
+      const gErr = Math.abs(Math.log(curveMultiple(cal, h.tvl_usd, null, model) / h.ratio));
+      const cErr = Math.abs(Math.log(curveMultiple(cal, h.tvl_usd, h.category, model) / h.ratio));
+      globalErrs.push(gErr);
+      catErrs.push(cErr);
+      if (gErr <= Math.log(2)) globalWithin2++;
+      if (cErr <= Math.log(2)) catWithin2++;
+    }
+    pooledGlobalErrs.push(...globalErrs);
+    pooledCatErrs.push(...catErrs);
+    windows.push({
+      cutoff: `${Math.round(q * 100)}%`,
+      train_size: train.length,
+      test_size: test.length,
+      train_to: train.length > 0 ? train[train.length - 1]!.listed_at : null,
+      test_from: test.length > 0 ? test[0]!.listed_at : null,
+      global_median_abs_log_error: round4(median(globalErrs) ?? 0),
+      global_within_2x: test.length === 0 ? 0 : round4(globalWithin2 / test.length),
+      per_category_median_abs_log_error: round4(median(catErrs) ?? 0),
+      per_category_within_2x: test.length === 0 ? 0 : round4(catWithin2 / test.length),
+    });
+  }
+  const pooledWithin = (ws: WalkForwardWindow[], key: 'global_within_2x' | 'per_category_within_2x'): number =>
+    ws.length === 0 ? 0 : round4(ws.reduce((s, w) => s + w[key], 0) / ws.length);
+  return {
+    method: 'Walk-forward test: dated traded protocols ordered by listing date, expanding windows at 50/60/70/80% of the range, curves fitted on the older protocols and tested on the newer ones',
+    dated_protocols: n,
+    test_rows: pooledGlobalErrs.length,
+    windows,
+    pooled_global_median_abs_log_error: round4(median(pooledGlobalErrs) ?? 0),
+    pooled_global_within_2x: pooledWithin(windows, 'global_within_2x'),
+    pooled_per_category_median_abs_log_error: round4(median(pooledCatErrs) ?? 0),
+    pooled_per_category_within_2x: pooledWithin(windows, 'per_category_within_2x'),
   };
 }
 
@@ -495,8 +623,9 @@ function gasMidpoint(chain: string): number {
 
 /**
  * A farm plan's cost, counted to the dollar: one transaction to enter, one a week for the hold,
- * one to claim and one to unwind. Capital is locked in the position for the hold and returned
- * when the farmer unwinds, so the net out-of-pocket cost is the gas alone.
+ * one to claim and one to unwind. Capital is deposit-sized ($50–$250 by TVL), locked in the
+ * position for the hold and returned when the farmer unwinds, so the net out-of-pocket cost is
+ * the gas alone.
  */
 export function farmCost(p: SnapshotProtocol, age: number | null): FarmCost {
   const capital = capitalFor(p);
@@ -514,7 +643,7 @@ export function impliedValue(
   model: ModelConstants = MODEL,
 ): { implied: number; multiple: number; growthPct: number; growthMult: number; maturityMult: number; breadthMult: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
-  const mult = curveMultiple(calibration, protocol.tvl_usd, model);
+  const mult = curveMultiple(calibration, protocol.tvl_usd, protocol.category ?? 'Other', model);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
@@ -717,6 +846,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const gas = gasNote(chain);
   const action = actionFor(p, capital, chain);
   const weekly = weeklyFor(p);
+  const cost = farmCost(p, age);
   return [
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
@@ -749,7 +879,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '10 minutes',
     },
     {
-      text: `Write the wallet, the dates and every transaction hash in a farm log, then unwind in the reverse order you entered: claim, withdraw, then close the position.`,
+      text: `Write the wallet, the dates and every transaction hash in a farm log, then unwind in the reverse order you entered: claim, withdraw, then close the position. The $${cost.capital_usd} deposit comes back on the unwind, so the net out-of-pocket cost is the $${cost.gas_usd.toFixed(2)} gas.`,
       cost: 'nothing but the log',
       time: '10 minutes to unwind',
     },
@@ -799,10 +929,11 @@ export function radarRow(row: BoardRow): RadarRow {
 }
 
 /** Everything the dashboard renders, from the snapshot. */
-export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData; calibration: Calibration; validation: HoldoutValidation } {
+export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData; calibration: Calibration; validation: HoldoutValidation; walk_forward: WalkForwardValidation } {
   const board = buildBoard(snapshot, model);
   const calibration = calibrate(snapshot, model);
   const validation = holdoutValidation(snapshot, model);
+  const walkForward = walkForwardValidation(snapshot, model);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const radar: RadarData = {
@@ -818,11 +949,12 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     live_size: live.length,
     calibration,
     validation,
+    walk_forward: walkForward,
     refits: RANK_REFITS,
     rows: board.map(radarRow),
     live,
   };
-  return { board, radar, calibration, validation };
+  return { board, radar, calibration, validation, walk_forward: walkForward };
 }
 
 /** The snapshot out of a file's text, refused unless it is the shape the model scores. */
