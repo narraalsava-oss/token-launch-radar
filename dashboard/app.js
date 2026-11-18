@@ -1,4 +1,4 @@
-// Token Radar, radar-2 dashboard. It reads window.RADAR (written beside dashboard/ by main.ts)
+// Token Radar, radar-4 dashboard. It reads window.RADAR (written beside dashboard/ by main.ts)
 // and renders the ranked board, a filterable table, a per-protocol detail dialog with the model's
 // own inputs, same-category comparables and the protocol's farm plan, plus the calibration the
 // model was fitted on. No network: every byte it shows is in data.js.
@@ -133,7 +133,7 @@
       { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
       { text: "Check the protocol's own points or rewards page once a month and note the balance in your farm log.", cost: 'no fee to check', time: '10 minutes a month' },
       { text: "Before you withdraw, open the protocol's own site from its official channel and claim only from the link it publishes, never from a message or an ad.", cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
-      { text: 'Write the wallet, the dates and every transaction hash in a farm log, then unwind in the reverse order you entered: claim, withdraw, then close the position.', cost: 'nothing but the log', time: '10 minutes to unwind' }
+      { text: 'Write the wallet, the dates and every transaction hash in a farm log, then unwind in the reverse order you entered: claim, withdraw, then close the position. The $' + (p.farm_cost ? p.farm_cost.capital_usd : capital) + ' deposit comes back on the unwind, so the net out-of-pocket cost is the $' + (p.farm_cost ? p.farm_cost.gas_usd.toFixed(2) : '0.00') + ' gas.', cost: 'nothing but the log', time: '10 minutes to unwind' }
     ].map(stepText);
   }
 
@@ -378,9 +378,9 @@
       el('h2', { text: 'How implied value is computed' }),
       el('p', { text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x ', el('b', { text: 'curveMultiple(tvl_usd)' }), ' x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + 0.02 x min(chains - 1, 5)) )'
+        'implied = round( tvl_usd x ', el('b', { text: 'curveMultiple(tvl_usd, category)' }), ' x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + 0.02 x min(chains - 1, 5)) )'
       ),
-      el('p', { text: 'The multiple is a comps curve fitted to the traded market, not a guess: ln(FDV/TVL) = ' + curve.intercept.toFixed(2) + ' ' + (curve.slope >= 0 ? '+' : '-') + ' ' + Math.abs(curve.slope).toFixed(2) + ' x ln(TVL), fitted by ordinary least squares over ' + curve.samples + ' traded protocols (correlation ' + curve.correlation.toFixed(2) + '). The market prices a dollar of TVL cheaper the larger the protocol is, so a protocol\u2019s multiple follows its own TVL, clamped to x' + m.multiple_floor + '–x' + m.multiple_cap + '. Each ratio is winsorized at x' + m.ratio_cap + ' first — the snapshot holds one traded protocol at 400x. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days.' }),
+      el('p', { text: 'The multiple is a comps curve fitted to the traded market, not a guess: the global curve is ln(FDV/TVL) = ' + curve.intercept.toFixed(2) + ' ' + (curve.slope >= 0 ? '+' : '-') + ' ' + Math.abs(curve.slope).toFixed(2) + ' x ln(TVL), fitted by ordinary least squares over ' + curve.samples + ' traded protocols (correlation ' + curve.correlation.toFixed(2) + '). Where a category holds at least ' + m.category_curve_min_n + ' traded protocols it gets its own curve, fitted the same way on its own protocols — ' + ((cal.category_curves || []).length) + ' categories qualify — and a thinner category falls back to the global curve. The market prices a dollar of TVL cheaper the larger the protocol is, so a protocol\u2019s multiple follows its own TVL and its category, clamped to x' + m.multiple_floor + '–x' + m.multiple_cap + '. Each ratio is winsorized at x' + m.ratio_cap + ' first — the snapshot holds one traded protocol at 400x. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days.' }),
       el('h2', { text: 'The curve at a glance' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'calib' },
@@ -389,10 +389,61 @@
         )
       )
     );
+    var catCurves = cal.category_curves || [];
+    if (catCurves.length > 0) {
+      panel.appendChild(el('h2', { text: 'Per-category curves' }));
+      panel.appendChild(el('p', { text: 'One curve per category with at least ' + m.category_curve_min_n + ' traded protocols, each fitted by ordinary least squares on its own protocols. The multiple shown is what the category\u2019s curve gives at $100M TVL, against the global curve\u2019s x' + curveAt(1e8).toFixed(2) + ' at the same TVL. A category not listed here is priced on the global curve.' }));
+      panel.appendChild(el('div', { class: 'table-wrap' },
+        el('table', { class: 'calib' },
+          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Category' }), el('th', { scope: 'col', text: 'Traded' }), el('th', { scope: 'col', text: 'Intercept' }), el('th', { scope: 'col', text: 'Slope' }), el('th', { scope: 'col', text: 'Multiple at $100M' }))),
+          el('tbody', null, catCurves.map(function (c) {
+            return el('tr', null,
+              el('td', { text: c.category }),
+              el('td', { class: 'num', text: String(c.samples) }),
+              el('td', { class: 'num', text: c.intercept.toFixed(2) }),
+              el('td', { class: 'num', text: c.slope.toFixed(2) }),
+              el('td', { class: 'num', text: 'x' + Math.min(m.multiple_cap, Math.max(m.multiple_floor, Math.exp(c.intercept + c.slope * Math.log(1e8)))).toFixed(2) })
+            );
+          }))
+        )
+      ));
+    }
     if (v) {
       panel.appendChild(el('h2', { text: 'Blind test: does the curve predict traded tokens?' }));
-      panel.appendChild(el('p', { text: 'A 5-fold blind test: the traded protocols are dealt by slug order into five folds, each fold is held out in turn, and the curve is fitted on the other 80%. Every one of the ' + v.holdout_size + ' traded protocols is predicted exactly once, by a fit that never saw it. Median absolute log error ' + v.median_abs_log_error.toFixed(2) + ' (a typical prediction is off by a factor of about ' + Math.exp(v.median_abs_log_error).toFixed(1) + 'x), median absolute percentage error ' + Math.round(v.median_abs_pct_error * 100) + '%, ' + Math.round(v.within_2x * 100) + '% of predictions within 2x and ' + Math.round(v.within_3x * 100) + '% within 3x. The naive baseline — one global median of x' + cal.global_median.toFixed(2) + ' for every protocol — scores ' + v.baseline_median_abs_log_error.toFixed(2) + ' median log error and ' + Math.round(v.baseline_within_2x * 100) + '% within 2x, so the curve adds real signal. The median log ratio of ' + v.median_log_ratio.toFixed(2) + ' says the curve under-predicts a typical traded protocol by about ' + Math.round((1 - Math.exp(v.median_log_ratio)) * 100) + '% — stated here rather than corrected away, because a correction fitted on the same data would leak the test.' }));
-      panel.appendChild(el('p', { text: 'Each row also carries a rank range: the 90% central band of its rank over ' + (DATA.refits || 200) + ' bootstrap refits of the curve. The top of the board is steady — rank 1 sits at 1–1, rank 2 at 2–2 — and the band widens down the board, where implied values crowd together. A wide band is the model saying it is unsure, not a second ranking.' }));
+      panel.appendChild(el('p', { text: 'A 5-fold blind test: the traded protocols are dealt by slug order into five folds, each fold is held out in turn, and the curves are fitted on the other 80% (per-category where the category holds ' + m.category_curve_min_n + '+ traded protocols, else the global curve). Every one of the ' + v.holdout_size + ' traded protocols is predicted exactly once, by a fit that never saw it. Median absolute log error ' + v.median_abs_log_error.toFixed(2) + ' (a typical prediction is off by a factor of about ' + Math.exp(v.median_abs_log_error).toFixed(1) + 'x), median absolute percentage error ' + Math.round(v.median_abs_pct_error * 100) + '%, ' + Math.round(v.within_2x * 100) + '% of predictions within 2x and ' + Math.round(v.within_3x * 100) + '% within 3x. The naive baseline — one global median of x' + cal.global_median.toFixed(2) + ' for every protocol — scores ' + v.baseline_median_abs_log_error.toFixed(2) + ' median log error and ' + Math.round(v.baseline_within_2x * 100) + '% within 2x, so the curves add real signal. The median log ratio of ' + v.median_log_ratio.toFixed(2) + ' says the curves under-predict a typical traded protocol by about ' + Math.round((1 - Math.exp(v.median_log_ratio)) * 100) + '% — stated here rather than corrected away, because a correction fitted on the same data would leak the test.' }));
+      panel.appendChild(el('p', { text: 'Each row also carries a rank range: the 90% central band of its rank over ' + (DATA.refits || 200) + ' bootstrap refits of the curves. The band widens down the board, where implied values crowd together — and wherever a row\u2019s value rests on a thinly sampled category curve, the band widens there too. A wide band is the model saying it is unsure, not a second ranking.' }));
+    }
+    var wf = DATA.walk_forward || null;
+    if (wf) {
+      var newest = wf.windows.slice(-2).map(function (w) { return w.global_median_abs_log_error; });
+      var older = wf.windows.slice(0, 2).map(function (w) { return w.global_median_abs_log_error; });
+      panel.appendChild(el('h2', { text: 'Walk-forward test: does the curve hold forward in time?' }));
+      panel.appendChild(el('p', { text: 'The 5-fold test shuffles time away. The walk-forward test keeps it: the ' + wf.dated_protocols + ' traded protocols with a listing date are ordered by that date, and at four expanding cutoffs the curves are fitted on the older protocols and tested on the newer ones — ' + wf.test_rows + ' test rows in all. The per-category curve beats the global curve where it counts, on the newer listings: pooled median absolute log error ' + wf.pooled_per_category_median_abs_log_error.toFixed(2) + ' against ' + wf.pooled_global_median_abs_log_error.toFixed(2) + ' for the global curve, with ' + Math.round(wf.pooled_per_category_within_2x * 100) + '% within 2x against ' + Math.round(wf.pooled_global_within_2x * 100) + '% — the same share, but closer on the typical protocol.' }));
+      panel.appendChild(el('div', { class: 'table-wrap' },
+        el('table', { class: 'calib' },
+          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Cutoff' }), el('th', { scope: 'col', text: 'Train' }), el('th', { scope: 'col', text: 'Test' }), el('th', { scope: 'col', text: 'Global err' }), el('th', { scope: 'col', text: 'Per-cat err' }), el('th', { scope: 'col', text: 'Global ≤2x' }), el('th', { scope: 'col', text: 'Per-cat ≤2x' }))),
+          el('tbody', null, wf.windows.map(function (w) {
+            return el('tr', null,
+              el('td', { text: w.cutoff + ' (to ' + (w.train_to || 'n/a') + ')' }),
+              el('td', { class: 'num', text: String(w.train_size) }),
+              el('td', { class: 'num', text: String(w.test_size) }),
+              el('td', { class: 'num', text: w.global_median_abs_log_error.toFixed(2) }),
+              el('td', { class: 'num', text: w.per_category_median_abs_log_error.toFixed(2) }),
+              el('td', { class: 'num', text: Math.round(w.global_within_2x * 100) + '%' }),
+              el('td', { class: 'num', text: Math.round(w.per_category_within_2x * 100) + '%' })
+            );
+          }).concat([el('tr', null,
+            el('td', { text: 'Pooled' }),
+            el('td', { class: 'num', text: '—' }),
+            el('td', { class: 'num', text: String(wf.test_rows) }),
+            el('td', { class: 'num', text: wf.pooled_global_median_abs_log_error.toFixed(2) }),
+            el('td', { class: 'num', text: wf.pooled_per_category_median_abs_log_error.toFixed(2) }),
+            el('td', { class: 'num', text: Math.round(wf.pooled_global_within_2x * 100) + '%' }),
+            el('td', { class: 'num', text: Math.round(wf.pooled_per_category_within_2x * 100) + '%' })
+          )]))
+        )
+      ));
+      panel.appendChild(el('p', { text: 'Regime drift is real: the newest cohorts are the hardest to price — on the ' + wf.windows[2].cutoff + ' and ' + wf.windows[3].cutoff + ' windows the global curve errs ' + Math.min.apply(null, newest).toFixed(2) + '–' + Math.max.apply(null, newest).toFixed(2) + ', against ' + Math.min.apply(null, older).toFixed(2) + '–' + Math.max.apply(null, older).toFixed(2) + ' on the older windows — and the per-category curve only partly closes the gap. A model fitted on yesterday\u2019s market should be read with that in mind.' }));
     }
     panel.appendChild(el('h2', { text: 'Category medians, for comparison' }));
     panel.appendChild(el('p', { text: 'The ranking does not use these: they are what an earlier median model would have said, shown so a reader can see why the curve replaced them. On the same 5-fold blind test the category medians scored 1.60 median log error, barely better than the 1.61 global-median baseline, because FDV/TVL varies so widely inside a category. Each median is shrunk toward the global median (weight ' + m.shrink_weight + ') and capped at ' + m.thin_cap_x_global + 'x it.' }));
@@ -434,14 +485,14 @@
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Curve multiple (at this TVL)' }), el('b', { class: 'num', text: fmtMult(row.multiple) })),
+        el('div', null, el('span', { text: 'Curve multiple (at this TVL, this category)' }), el('b', { class: 'num', text: fmtMult(row.multiple) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: row.growth_multiplier.toFixed(4) })),
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: row.maturity_multiplier.toFixed(4) })),
         el('div', null, el('span', { text: 'Chain breadth' }), el('b', { class: 'num', text: row.breadth_multiplier.toFixed(2) })),
         el('div', null, el('span', { text: 'Rank range (90% band)' }), el('b', { class: 'num', text: (row.rank_lo || row.rank) + '–' + (row.rank_hi || row.rank) })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
-      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' Its rank range is the 90% band of its rank over ' + (DATA.refits || 200) + ' bootstrap refits of the curve. This is an estimate, not a price, and it says nothing about whether or when a token launches.' })
+      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' Its rank range is the 90% band of its rank over ' + (DATA.refits || 200) + ' bootstrap refits of the curves. This is an estimate, not a price, and it says nothing about whether or when a token launches.' })
     ));
     if (peers.length > 0) {
       dialog.appendChild(el('section', { class: 'detail-section' },
@@ -479,9 +530,9 @@
         el('div', null, el('span', { text: 'Transactions' }), el('b', { class: 'num', text: String(fc.tx_count) })),
         el('div', null, el('span', { text: 'Gas, all transactions' }), el('b', { class: 'num', text: '$' + fc.gas_usd.toFixed(2) })),
         el('div', null, el('span', { text: 'Hold' }), el('b', { class: 'num', text: fc.hold_days + ' days' })),
-        el('div', null, el('span', { text: 'Net out of pocket' }), el('b', { class: 'num', text: '$' + fc.net_usd.toFixed(2) }))
+        el('div', null, el('span', { text: 'Net out of pocket after unwind' }), el('b', { class: 'num', text: '$' + fc.net_usd.toFixed(2) }))
       ),
-      el('p', { class: 'sub', text: 'The capital is locked in the position for the hold and returned when the farmer unwinds, so the net cost is the gas alone. Gas is counted at the midpoint of the chain\u2019s fee range the farm steps quote: one transaction to enter, one a week for the hold, one to claim and one to unwind.' })
+      el('p', { class: 'sub', text: 'The capital is deposit-sized ($50–$250 by TVL), locked in the position for the hold and returned when the farmer unwinds, so the net cost is the gas alone. Gas is counted at the midpoint of the chain\u2019s fee range the farm steps quote: one transaction to enter, one a week for the hold, one to claim and one to unwind.' })
     ));
     if (typeof dialog.showModal === 'function') {
       if (!dialog.open) dialog.showModal();
